@@ -51,10 +51,12 @@
  *        que exige consenso entre várias fatias seguidas antes de aceitar
  *        um rótulo — evita que uma fatia de transição/ruído dispare a
  *        ação errada no meio da palavra (o "pisca")
- *      - Ação por MUDANÇA DE ESTADO (edge-trigger), não por leitura isolada:
- *           "acende" (e LED ainda apagado) -> LED ON e permanece ligado
- *           "apaga"  (e LED ainda aceso)   -> LED OFF e permanece desligado
- *        (com buzzer de confirmação a cada transição)
+ *      - Ação por reconhecimento direto de "acende" (confiança alta em uma
+ *        única fatia + cooldown contra disparo repetido): liga o LED e
+ *        inicia um software timer do FreeRTOS (xLedOffTimer, one-shot) que
+ *        apaga o LED sozinho após LED_ON_DURATION_MS (2s). Se "acende" for
+ *        dito de novo enquanto o LED está aceso, o timer é reiniciado.
+ *        (com buzzer de confirmação ao ligar)
  *      - Libera o buffer de volta para a Task 1 (xBufferFree[i])
  *      - Atualiza estatísticas e mede a latência ponta-a-ponta
  *
@@ -100,6 +102,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "driver/i2s.h"
 #include "esp_timer.h"
 #include "rom/ets_sys.h"   // ets_delay_us
@@ -131,6 +134,16 @@
 #define I2S_DMA_READ_SAMPLES     512    // amostras lidas por chamada de i2s_read
 #define SILENCE_RMS_THRESHOLD    250.0f // abaixo disso, Task 2 marca como silêncio
 #define ACTION_COOLDOWN_MS       800    // tempo mínimo entre duas ações de LED
+
+// ---- Acionamento direto do LED por comando de voz ----
+// Em vez de depender do consenso do suavizador (ei_classifier_smooth_update),
+// que exige varias fatias seguidas com o MESMO rotulo e pode nunca "fechar"
+// para uma palavra curta como "acende", a acao passa a usar a classificacao
+// crua (best_label/best_conf) de UMA fatia, desde que a confianca supere
+// HIGH_CONFIDENCE_THRESHOLD. O ACTION_COOLDOWN_MS acima ja evita disparos
+// repetidos enquanto a mesma palavra continua sendo dita.
+#define HIGH_CONFIDENCE_THRESHOLD 0.40f
+#define LED_ON_DURATION_MS        2000   // LED fica aceso por 2s e apaga sozinho
 
 /* =========================== PRIORIDADES DAS TASKS ======================= */
 #define PRIORITY_CAPTURE      (tskIDLE_PRIORITY + 4)   // ALTA
@@ -184,6 +197,11 @@ static SemaphoreHandle_t xPrintMutex;
 static QueueHandle_t xCaptureQueue;   // Task1 -> Task2 : uint8_t (índice do buffer)
 static QueueHandle_t xFeatureQueue;   // Task2 -> Task3 : feature_packet_t
 
+// Software timer do FreeRTOS: dispara 1x, LED_ON_DURATION_MS depois de ligado,
+// e desliga o LED sozinho (roda na "Timer Service Task" do FreeRTOS, fora das
+// 3 tasks do pipeline -> mais um ponto de concorrencia tratado no projeto).
+static TimerHandle_t xLedOffTimer;
+
 static system_state_t g_state = { "unknown", 0.0f, false, 0, 0, 0 };
 
 // Suavizador oficial do SDK Edge Impulse (edge-impulse-sdk/classifier/ei_classifier_smooth.h,
@@ -218,6 +236,19 @@ static void setLed(bool on) {
     digitalWrite(PIN_BUZZER, LOW);
 #endif
     xSemaphoreGive(xHardwareMutex);
+}
+
+// Callback do software timer (FreeRTOS Timer Service Task): chamado uma
+// unica vez, LED_ON_DURATION_MS depois de "acende" ser reconhecido, para
+// apagar o LED automaticamente sem travar nenhuma das 3 tasks do pipeline.
+static void ledOffTimerCallback(TimerHandle_t xTimer) {
+    setLed(false);
+
+    xSemaphoreTake(xStateMutex, portMAX_DELAY);
+    g_state.led_on = false;
+    xSemaphoreGive(xStateMutex);
+
+    safePrintf("[Timer] LED apagado automaticamente apos %dms\n", LED_ON_DURATION_MS);
 }
 
 /* ========================= I2S: init / captura ============================ */
@@ -445,29 +476,34 @@ static void taskAnomalyDetection(void *pvParameters) {
             strncpy(g_state.last_label, best_label, sizeof(g_state.last_label) - 1);
             g_state.last_confidence = best_conf;
             g_state.total_slices_processed++;
-            bool led_currently_on = g_state.led_on;
+            uint32_t last_action = g_state.last_action_ms;
             xSemaphoreGive(xStateMutex);
 
-            // ---- Decisão / ação (LED conforme comando de voz, com EDGE-TRIGGER) ----
-            // Só liga se o comando suavizado for "acende" E o LED ainda não
-            // estiver ligado; só desliga se for "apaga" E o LED ainda estiver
-            // ligado. Isso garante que o LED "fica aceso até eu falar apaga",
-            // sem repetir a ação (e sem piscar) enquanto a mesma palavra
-            // continua sendo reconhecida nas fatias seguintes.
+            // ---- Decisão / ação: aciona o LED pela classificação CRUA de uma
+            // única fatia (best_label/best_conf), não pelo smoothed_label.
+            // Motivo: o suavizador (ei_classifier_smooth_update) só aceita um
+            // rótulo depois de várias fatias seguidas IGUAIS; para uma palavra
+            // curta como "acende" isso quase nunca "fecha" a tempo, e por
+            // isso o LED não acendia mesmo com o rótulo certo aparecendo no
+            // log. Aqui, basta UMA fatia com confiança alta; o cooldown
+            // (ACTION_COOLDOWN_MS) evita múltiplos disparos enquanto a mesma
+            // palavra continua sendo dita/ecoando.
             bool triggered = false;
-            if (strcmp(smoothed_label, "acende") == 0 && !led_currently_on) {
-                setLed(true);
-                triggered = true;
-            } else if (strcmp(smoothed_label, "apaga") == 0 && led_currently_on) {
-                setLed(false);
-                triggered = true;
-            }
+            uint32_t now_ms = millis();
+            if (strcmp(best_label, "acende") == 0 &&
+                best_conf >= HIGH_CONFIDENCE_THRESHOLD &&
+                (now_ms - last_action) >= ACTION_COOLDOWN_MS) {
 
-            if (triggered) {
+                setLed(true);
+                // (re)inicia a contagem de 2s: se "acende" for dito de novo
+                // enquanto o LED ainda está aceso, o tempo é renovado.
+                xTimerReset(xLedOffTimer, 0);
+                triggered = true;
+
                 xSemaphoreTake(xStateMutex, portMAX_DELAY);
-                g_state.led_on = (strcmp(smoothed_label, "acende") == 0);
+                g_state.led_on = true;
                 g_state.total_commands_detected++;
-                g_state.last_action_ms = millis();
+                g_state.last_action_ms = now_ms;
                 xSemaphoreGive(xStateMutex);
             }
 
@@ -535,8 +571,16 @@ void setup() {
     xCaptureQueue = xQueueCreate(2, sizeof(uint8_t));
     xFeatureQueue = xQueueCreate(2, sizeof(feature_packet_t));
 
+    // Timer de disparo unico (pdFALSE = one-shot): criado parado, e
+    // (re)iniciado com xTimerReset() toda vez que "acende" é reconhecido.
+    xLedOffTimer = xTimerCreate("LedOffTimer", pdMS_TO_TICKS(LED_ON_DURATION_MS),
+                                 pdFALSE, NULL, ledOffTimerCallback);
+    if (xLedOffTimer == NULL) {
+        Serial.println("ERRO: falha ao criar xLedOffTimer");
+    }
+
     Serial.println("\n=== Detector de Anomalias Acusticas - ESP32 + INMP441 + FreeRTOS ===");
-    ei_printf("Comandos reconhecidos: 'acende' (LED ON) / 'apaga' (LED OFF)\n");
+    ei_printf("Comando reconhecido: 'acende' -> LED liga por %dms e apaga sozinho\n", LED_ON_DURATION_MS);
     ei_printf("Sample rate: %d Hz | Slice: %d amostras (%d ms) | Threshold: %.2f\n",
         EI_CLASSIFIER_FREQUENCY, EI_CLASSIFIER_SLICE_SIZE,
         (int)((float)EI_CLASSIFIER_SLICE_SIZE * 1000.0f / EI_CLASSIFIER_FREQUENCY),
