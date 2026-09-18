@@ -6,7 +6,6 @@
  * acústicos específicos em meio ao ruído de fundo ("unknown"):
  *
  *      "acende"  -> liga o LED (GPIO 17)
- *      "apaga"   -> desliga o LED (GPIO 17)
  *
  * Justificativa prática: controle de iluminação por voz hands-free é um caso
  * real de "spotting" de palavra-chave (keyword spotting) embarcado, a mesma
@@ -47,10 +46,6 @@
  *      - Recebe o pacote de features (xFeatureQueue)
  *      - Roda o modelo pré-treinado (MFCC + rede neural) sobre o buffer
  *        de áudio indicado
- *      - Usa o suavizador oficial do SDK (ei_classifier_smooth_update),
- *        que exige consenso entre várias fatias seguidas antes de aceitar
- *        um rótulo — evita que uma fatia de transição/ruído dispare a
- *        ação errada no meio da palavra (o "pisca")
  *      - Ação por reconhecimento direto de "acende" (confiança alta em uma
  *        única fatia + cooldown contra disparo repetido): liga o LED e
  *        inicia um software timer do FreeRTOS (xLedOffTimer, one-shot) que
@@ -204,11 +199,6 @@ static TimerHandle_t xLedOffTimer;
 
 static system_state_t g_state = { "unknown", 0.0f, false, 0, 0, 0 };
 
-// Suavizador oficial do SDK Edge Impulse (edge-impulse-sdk/classifier/ei_classifier_smooth.h,
-// já incluído por lu.petenazzi-project-1_inferencing.h). Evita que uma única fatia (slice de
-// ~250ms) ruidosa/de transição dispare uma ação errada no meio da pronúncia da palavra —
-// exige consenso de várias leituras seguidas antes de aceitar um rótulo como válido.
-static ei_classifier_smooth_t g_smooth;
 
 /* =============================== UTILITÁRIOS ============================= */
 
@@ -450,10 +440,7 @@ static void taskAnomalyDetection(void *pvParameters) {
                 continue;
             }
 
-            // Encontra a classe de maior confiança NESTA fatia (~250ms) — usada só
-            // para log/depuração. A DECISÃO de acionar o LED usa o rótulo
-            // suavizado (ei_classifier_smooth_update), não este valor cru,
-            // pois uma única fatia de transição pode vir com o rótulo errado.
+           
             int best_idx = 0;
             for (size_t ix = 1; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
                 if (result.classification[ix].value > result.classification[best_idx].value) {
@@ -463,11 +450,7 @@ static void taskAnomalyDetection(void *pvParameters) {
             const char *best_label = result.classification[best_idx].label;
             float best_conf = result.classification[best_idx].value;
 
-            // ---- Suavização oficial do SDK: exige consenso entre várias fatias
-            // seguidas antes de aceitar um comando como válido. Retorna
-            // "acende" / "apaga" / "unknown" (rótulos do modelo) ou
-            // "uncertain" / "anomaly" quando não há consenso suficiente.
-            const char *smoothed_label = ei_classifier_smooth_update(&g_smooth, &result);
+    
 
             int64_t t_detect_end = esp_timer_get_time();
 
@@ -510,9 +493,9 @@ static void taskAnomalyDetection(void *pvParameters) {
             // ---- Log de latências (ponta-a-ponta) ----
             int64_t total_latency_us = t_detect_end - pkt.t_capture_done_us;
             safePrintf(
-                "[Task3] slice=%-8s(%.2f) suavizado=%-9s | RMS=%.1f centroid~%.0fHz | "
+                "[Task3] slice=%-8s(%.2f) | RMS=%.1f centroid~%.0fHz | "
                 "DSP=%dms NN=%dms | lat.total=%.1fms%s\n",
-                best_label, best_conf, smoothed_label, pkt.rms, pkt.spectral_centroid_hz,
+                best_label, best_conf, pkt.rms, pkt.spectral_centroid_hz,
                 (int)result.timing.dsp, (int)result.timing.classification,
                 total_latency_us / 1000.0,
                 triggered ? "  <-- ACAO EXECUTADA" : "");
@@ -588,12 +571,7 @@ void setup() {
 
     run_classifier_init();
 
-    // 8 leituras (~2s de historico) e exige que pelo menos 5 concordem
-    // entre si (maioria) para aceitar um comando -> elimina o "pisca"
-    // causado por slices de transicao classificados incorretamente.
-    ei_classifier_smooth_init(&g_smooth, /*n_readings=*/8, /*min_readings_same=*/5,
-                               /*classifier_confidence=*/(float)EI_CLASSIFIER_THRESHOLD,
-                               /*anomaly_confidence=*/0.3f);
+   
 
     if (!startAudioPipeline()) {
         ei_printf("Falha critica ao iniciar pipeline de audio. Reiniciando em 5s...\n");
