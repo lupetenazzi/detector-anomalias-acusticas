@@ -53,7 +53,10 @@
  *        dito de novo enquanto o LED está aceso, o timer é reiniciado.
  *        (com buzzer de confirmação ao ligar)
  *      - Libera o buffer de volta para a Task 1 (xBufferFree[i])
- *      - Atualiza estatísticas e mede a latência ponta-a-ponta
+ *      - Atualiza estatísticas e mede a latência de cada etapa (captura, filas,
+ *        Task 2, DSP/MFCC, NN, total, ponta-a-ponta e alerta), acumulando
+ *        mín/média/máx em g_lat[] (protegido por xStateMutex). O loop()
+ *        imprime o resumo a cada 5 s.
  *
  * ----------------------------------------------------------------------------
  * MECANISMOS DE SINCRONIZAÇÃO (concorrência) usados
@@ -137,8 +140,8 @@
 // crua (best_label/best_conf) de UMA fatia, desde que a confianca supere
 // HIGH_CONFIDENCE_THRESHOLD. O ACTION_COOLDOWN_MS acima ja evita disparos
 // repetidos enquanto a mesma palavra continua sendo dita.
-#define HIGH_CONFIDENCE_THRESHOLD 0.40f
-#define LED_ON_DURATION_MS        2000   // LED fica aceso por 2s e apaga sozinho
+#define HIGH_CONFIDENCE_THRESHOLD 0.50f
+#define LED_ON_DURATION_MS        1000   // LED fica aceso por 2s e apaga sozinho
 
 /* =========================== PRIORIDADES DAS TASKS ======================= */
 #define PRIORITY_CAPTURE      (tskIDLE_PRIORITY + 4)   // ALTA
@@ -165,8 +168,11 @@ typedef struct {
     float    rms;
     float    spectral_centroid_hz;   // estimado via ZCR
     bool     is_silence;
-    int64_t  t_capture_done_us;
-    int64_t  t_feature_done_us;
+    // Timestamps (esp_timer, microssegundos) de cada etapa do pipeline:
+    int64_t  t_capture_start_us;   // Task 1: começou a encher este buffer (0 = desconhecido)
+    int64_t  t_capture_done_us;    // Task 1: buffer ficou cheio (entregue à fila)
+    int64_t  t_feature_start_us;   // Task 2: retirou o índice da fila e começou
+    int64_t  t_feature_done_us;    // Task 2: terminou RMS/ZCR
 } feature_packet_t;
 
 // Estado global compartilhado (protegido por xStateMutex)
@@ -199,12 +205,48 @@ static TimerHandle_t xLedOffTimer;
 
 static system_state_t g_state = { "unknown", 0.0f, false, 0, 0, 0 };
 
+// ---- Medição de latência por etapa ----
+// A Task 1 registra aqui o instante em que cada buffer começou/terminou de
+// encher; a Task 2 lê esses valores logo após receber o índice pela fila
+// (a fila garante a ordem: escrita da Task 1 acontece antes da leitura da
+// Task 2) e os repassa dentro do feature_packet_t. Assim a fila xCaptureQueue
+// continua carregando só o índice do buffer.
+static volatile int64_t g_t_buf_start_us[2] = { 0, 0 };
+static volatile int64_t g_t_buf_full_us[2]  = { 0, 0 };
+
+enum {
+    LAT_CAPTURE = 0,   // Task 1: tempo para encher o buffer (janela de aquisição)
+    LAT_QUEUE12,       // espera na fila Task 1 -> Task 2
+    LAT_FEATURE,       // Task 2: RMS + ZCR
+    LAT_QUEUE23,       // espera na fila Task 2 -> Task 3
+    LAT_DSP,           // Task 3: MFCC (result.timing.dsp_us)
+    LAT_NN,            // Task 3: rede neural (result.timing.classification_us)
+    LAT_T3,            // Task 3: tempo total de processamento
+    LAT_E2E,           // buffer cheio -> fim da classificação
+    LAT_ALERT,         // buffer cheio -> LED acionado (só quando há comando)
+    LAT_COUNT
+};
+
+static const char *LAT_NAMES[LAT_COUNT] = {
+    "Captura (encher buf)", "Fila T1->T2", "Task2 features", "Fila T2->T3",
+    "Task3 DSP (MFCC)", "Task3 NN", "Task3 total", "Ponta-a-ponta", "Alerta (buf->LED)"
+};
+
+typedef struct {
+    uint32_t n;
+    int64_t  sum_us;
+    int64_t  min_us;
+    int64_t  max_us;
+} lat_stat_t;
+
+static lat_stat_t g_lat[LAT_COUNT];   // protegido por xStateMutex
+
 
 /* =============================== UTILITÁRIOS ============================= */
 
 // Serial.print thread-safe (evita mensagens intercaladas entre as 3 tasks)
 static void safePrintf(const char *fmt, ...) {
-    char buf[192];
+    char buf[384];   // maior que antes: a linha de log da Task 3 agora inclui as latências
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
@@ -213,6 +255,35 @@ static void safePrintf(const char *fmt, ...) {
     xSemaphoreTake(xPrintMutex, portMAX_DELAY);
     Serial.print(buf);
     xSemaphoreGive(xPrintMutex);
+}
+
+// Acumula uma amostra de latência (us). DEVE ser chamada com xStateMutex
+// tomado. Valores negativos significam "não medido" e são ignorados.
+static void latRecord(int stage, int64_t us) {
+    if (us < 0) return;
+    lat_stat_t *s = &g_lat[stage];
+    if (s->n == 0) {
+        s->min_us = us;
+        s->max_us = us;
+    } else {
+        if (us < s->min_us) s->min_us = us;
+        if (us > s->max_us) s->max_us = us;
+    }
+    s->sum_us += us;
+    s->n++;
+}
+
+// Imprime o resumo (mín/média/máx em ms) a partir de uma cópia local.
+static void printLatencySummary(const lat_stat_t *snap) {
+    safePrintf("---- LATENCIA POR ETAPA (ms) ----\n");
+    for (int i = 0; i < LAT_COUNT; i++) {
+        if (snap[i].n == 0) continue;
+        safePrintf("  %-21s n=%-5lu min=%8.2f  media=%8.2f  max=%8.2f\n",
+                   LAT_NAMES[i], (unsigned long)snap[i].n,
+                   snap[i].min_us / 1000.0,
+                   (snap[i].sum_us / (double)snap[i].n) / 1000.0,
+                   snap[i].max_us / 1000.0);
+    }
 }
 
 // Liga/desliga o LED de forma protegida (seção crítica de hardware)
@@ -313,7 +384,15 @@ static void taskCaptureAudio(void *pvParameters) {
                 uint8_t next = cur ^ 1;
 
                 uint8_t ready_idx = cur;
-                xQueueSend(xCaptureQueue, &ready_idx, 0);
+                g_t_buf_full_us[cur] = esp_timer_get_time();   // instante em que o buffer ficou cheio
+                if (xQueueSend(xCaptureQueue, &ready_idx, 0) != pdTRUE) {
+                    // Fila cheia: este buffer NÃO será processado por ninguém.
+                    // Sem este tratamento ele nunca seria liberado e a Task 1
+                    // travaria 500 ms esperando por ele na próxima volta.
+                    xSemaphoreGive(xBufferFree[cur]);
+                    safePrintf("[Task1] AVISO: fila de captura cheia, "
+                               "buffer %d descartado\n", cur);
+                }
 
                 // Antes de começar a escrever no outro buffer, garante que a
                 // Task 3 já terminou de usá-lo em um ciclo anterior
@@ -323,6 +402,7 @@ static void taskCaptureAudio(void *pvParameters) {
                                "buffer %d ainda em uso (possível perda de amostras)\n", next);
                 }
 
+                g_t_buf_start_us[next] = esp_timer_get_time();   // início do preenchimento do próximo buffer
                 inference.buf_select = next;
             }
         }
@@ -376,7 +456,9 @@ static void taskFeatureExtraction(void *pvParameters) {
             pkt.rms                   = rms;
             pkt.spectral_centroid_hz  = spectral_centroid_approx;
             pkt.is_silence            = (rms < SILENCE_RMS_THRESHOLD);
-            pkt.t_capture_done_us     = t_start;
+            pkt.t_capture_start_us    = g_t_buf_start_us[buf_idx];   // vindos da Task 1
+            pkt.t_capture_done_us     = g_t_buf_full_us[buf_idx];    // (buffer cheio de verdade)
+            pkt.t_feature_start_us    = t_start;
             pkt.t_feature_done_us     = t_end;
 
             if (xQueueSend(xFeatureQueue, &pkt, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -472,11 +554,13 @@ static void taskAnomalyDetection(void *pvParameters) {
             // (ACTION_COOLDOWN_MS) evita múltiplos disparos enquanto a mesma
             // palavra continua sendo dita/ecoando.
             bool triggered = false;
+            int64_t t_alert_us = 0;   // instante do acionamento (medido logo antes de ligar o LED)
             uint32_t now_ms = millis();
             if (strcmp(best_label, "acende") == 0 &&
                 best_conf >= HIGH_CONFIDENCE_THRESHOLD &&
                 (now_ms - last_action) >= ACTION_COOLDOWN_MS) {
 
+                t_alert_us = esp_timer_get_time();
                 setLed(true);
                 // (re)inicia a contagem de 2s: se "acende" for dito de novo
                 // enquanto o LED ainda está aceso, o tempo é renovado.
@@ -490,15 +574,43 @@ static void taskAnomalyDetection(void *pvParameters) {
                 xSemaphoreGive(xStateMutex);
             }
 
-            // ---- Log de latências (ponta-a-ponta) ----
-            int64_t total_latency_us = t_detect_end - pkt.t_capture_done_us;
+            // ---- Latência por etapa (apenas mede e registra; não interfere na decisão) ----
+            int64_t lat_capture = (pkt.t_capture_start_us > 0)
+                                    ? (pkt.t_capture_done_us - pkt.t_capture_start_us) : -1;
+            int64_t lat_q12   = pkt.t_feature_start_us - pkt.t_capture_done_us;
+            int64_t lat_feat  = pkt.t_feature_done_us  - pkt.t_feature_start_us;
+            int64_t lat_q23   = t_detect_start - pkt.t_feature_done_us;
+            int64_t lat_t3    = t_detect_end   - t_detect_start;
+            int64_t lat_e2e   = t_detect_end   - pkt.t_capture_done_us;
+            int64_t lat_alert = triggered ? (t_alert_us - pkt.t_capture_done_us) : -1;
+
+            xSemaphoreTake(xStateMutex, portMAX_DELAY);
+            latRecord(LAT_CAPTURE, lat_capture);
+            latRecord(LAT_QUEUE12, lat_q12);
+            latRecord(LAT_FEATURE, lat_feat);
+            latRecord(LAT_QUEUE23, lat_q23);
+            latRecord(LAT_DSP,     (int64_t)result.timing.dsp_us);
+            latRecord(LAT_NN,      (int64_t)result.timing.classification_us);
+            latRecord(LAT_T3,      lat_t3);
+            latRecord(LAT_E2E,     lat_e2e);
+            latRecord(LAT_ALERT,   lat_alert);
+            xSemaphoreGive(xStateMutex);
+
+            // ---- Log por slice (ms) ----
+            char alert_str[48] = "";
+            if (triggered) {
+                snprintf(alert_str, sizeof(alert_str), "  <-- ACAO EXECUTADA (alerta=%.1fms)",
+                         lat_alert / 1000.0);
+            }
             safePrintf(
                 "[Task3] slice=%-8s(%.2f) | RMS=%.1f centroid~%.0fHz | "
-                "DSP=%dms NN=%dms | lat.total=%.1fms%s\n",
+                "q1=%.1f T2=%.2f q2=%.1f DSP=%.1f NN=%.1f T3=%.1f | E2E=%.1fms%s\n",
                 best_label, best_conf, pkt.rms, pkt.spectral_centroid_hz,
-                (int)result.timing.dsp, (int)result.timing.classification,
-                total_latency_us / 1000.0,
-                triggered ? "  <-- ACAO EXECUTADA" : "");
+                lat_q12 / 1000.0, lat_feat / 1000.0, lat_q23 / 1000.0,
+                (double)result.timing.dsp_us / 1000.0,
+                (double)result.timing.classification_us / 1000.0,
+                lat_t3 / 1000.0, lat_e2e / 1000.0,
+                alert_str);
         }
     }
 }
@@ -547,8 +659,11 @@ void setup() {
 
     xBufferFree[0] = xSemaphoreCreateBinary();
     xBufferFree[1] = xSemaphoreCreateBinary();
-    // ambos os buffers começam livres
-    xSemaphoreGive(xBufferFree[0]);
+    // xBufferFree[i] disponível = buffer i NÃO está com a Task 1 nem em
+    // processamento. A Task 1 já começa escrevendo no buffer 0 (posse dela,
+    // sem tomar o semáforo), então o semáforo do buffer 0 começa INDISPONÍVEL;
+    // só será liberado pela Task 3 depois de processar o buffer 0. Só o
+    // buffer 1 (que a Task 1 ainda vai tomar ao trocar de buffer) começa livre.
     xSemaphoreGive(xBufferFree[1]);
 
     xCaptureQueue = xQueueCreate(2, sizeof(uint8_t));
@@ -600,11 +715,14 @@ void loop() {
         bool led = g_state.led_on;
         uint32_t slices = g_state.total_slices_processed;
         uint32_t commands = g_state.total_commands_detected;
+        lat_stat_t lat_snap[LAT_COUNT];
+        memcpy(lat_snap, g_lat, sizeof(lat_snap));   // cópia sob mutex; impressão fora dele
         xSemaphoreGive(xStateMutex);
 
         safePrintf("---- STATUS: LED=%s | ultimo=%s(%.2f) | slices=%lu | comandos=%lu ----\n",
             led ? "ON" : "OFF", label, conf,
             (unsigned long)slices, (unsigned long)commands);
+        printLatencySummary(lat_snap);
     }
 
     vTaskDelay(pdMS_TO_TICKS(200));
