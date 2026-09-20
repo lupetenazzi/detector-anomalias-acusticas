@@ -1,8 +1,8 @@
-/* ============================================================================
+/* 
  * Detector de Anomalias Acústicas — ESP32 + INMP441 + FreeRTOS
  * ----------------------------------------------------------------------------
- * Aplicação escolhida: comando de voz como "anomalia acústica de interesse".
- * O sistema escuta o microfone continuamente e reconhece dois padrões
+ * Comando de voz como "anomalia acústica de interesse".
+ * O sistema escuta o microfone continuamente e reconhece padrões
  * acústicos específicos em meio ao ruído de fundo ("unknown"):
  *
  *      "acende"  -> liga o LED (GPIO 17)
@@ -10,7 +10,7 @@
  * Justificativa prática: controle de iluminação por voz hands-free é um caso
  * real de "spotting" de palavra-chave (keyword spotting) embarcado, a mesma
  * classe de problema usada em campainhas inteligentes, assistentes de voz de
- * baixo consumo e sistemas de acessibilidade — aqui tratado como detecção de
+ * baixo consumo e sistemas de acessibilidade, aqui tratado como detecção de
  * um padrão acústico específico (anomalia) em meio ao áudio ambiente comum.
  *
  * Modelo: rede treinada no Edge Impulse (MFCC + rede neural), classes:
