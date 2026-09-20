@@ -3,11 +3,11 @@
 **Projeto do modelo (Edge Impulse Studio):** <https://studio.edgeimpulse.com/public/1114645/live>
 
 
-## 1. Objetivo
+## Objetivo
 
 O objetivo da atividade é implementar um sistema embarcado de detecção de anomalias acústicas em tempo real, aplicando conceitos de RTOS, processamento de sinais em edge computing e sincronização de tarefas concorrentes.
 
-### 1.1 Aplicação escolhida e justificativa
+### 1. Aplicação e justificativa
 
 O enunciado deixa livre a escolha do som a detectar. Escolhi uma aplicação simples de propósito: **reconhecer um comando de voz ("acende") e acionar um LED**. MInha escolha foi definida assim porque meu foco nesta atividade era aprender e entender de verdade a arquitetura, ligando os aprendizados de sala sobre RTOS a algo que eu conseguisse testar sozinha. 
 
@@ -24,7 +24,7 @@ O comportamento desejado é:
 Inicialmente pensei em fazer o LED ficar aceso até eu dizer "apaga". Mudei de ideia e passei a apagá-lo por um **software timer** depois de 1 segundo. A escolha simplifica o comportamento (o LED não depende de um segundo comando reconhecido corretamente) e me permitiu usar mais um mecanismo de RTOS (o timer do FreeRTOS), que roda fora das três tarefas.
 
 
-## 2. Requisitos do enunciado e onde foram atendidos
+## Requisitos do enunciado e onde foram atendidos
 
 | Requisito do enunciado | Como foi atendido |
 |---|---|
@@ -40,7 +40,7 @@ Inicialmente pensei em fazer o LED ficar aceso até eu dizer "apaga". Mudei de i
 | Relatório técnico | Este documento |
 
 
-## 3. Hardware e montagem
+## Hardware e montagem
 
 A montagem física usa o **ESP32**, o **microfone INMP441**, um **LED** e um **resistor** em série com o LED. Não usei o buzzer.
 
@@ -58,11 +58,11 @@ Parâmetros da captura de áudio: 16 kHz, 16 bits, canal esquerdo, interface I2S
 O firmware tem suporte a um buzzer no GPIO 4 (`USE_BUZZER`). No diagrama ele aparece junto ao LED por isso, mas na montagem física usei só o LED.
 
 
-## 4. Modelo de detecção
+## Modelo de detecção
 
 Usei o **Edge Impulse Studio** para treinar o modelo. Escolhi a plataforma por ser intuitiva e por ajudar em todo o ciclo: **criar o dataset de áudios** (gravando e rotulando as amostras), **ajustar o processamento e a rede** e **refinar o modelo** olhando as métricas. O Studio também exporta a biblioteca pronta para Arduino, que integrei ao firmware.
 
-### 4.1 Dataset
+### 1. Dataset
 
 O modelo tem três classes, na ordem em que aparecem no firmware: `acende`, `apaga` e `unknown`.
 
@@ -75,7 +75,7 @@ As amostras têm 1 segundo de duração e taxa de amostragem de 16 kHz.
 No total, utilizei 536 amostras em treinamento e 133 em teste.
 
 
-### 4.2 Resultados de validação no Studio
+### 2. Resultados de validação no Studio
 
 | Métrica (conjunto de validação) | Valor |
 |---|---:|
@@ -94,18 +94,17 @@ Matriz de confusão da validação (linhas = classe real; colunas = classe previ
 | **apaga** | 2,8 % | 97,2 % | 0 % | 0,83 |
 | **unknown** | 6,5 % | 38,7 % | 54,8 % | 0,71 |
 
-As classes `acende` e `apaga` foram bem separadas. A classe `unknown` é a mais fraca: só 54,8 % das amostras `unknown` foram reconhecidas como tal, e 38,7 % foram classificadas como `apaga`. Isso vai reaparecer nos testes reais (seção 7).
 
 
-## 5. Arquitetura RTOS
+## Arquitetura RTOS
 
-### 5.1 Diagrama
+### 1. Diagrama
 
 ![Diagrama de tarefas RTOS](diagrama/Diagrama_RTOS.svg)
 
 O sistema roda três tarefas em pipeline. O áudio entra pela Task 1, o índice do buffer cheio passa pela fila para a Task 2, o pacote de features passa pela outra fila para a Task 3, e a Task 3 aciona o LED. A linha tracejada de volta é o semáforo que devolve o buffer à Task 1. Outra linha tracejada mostra o software timer que apaga o LED.
 
-### 5.2 Tarefas
+### 2. Tarefas
 
 | Tarefa | Prioridade | Função |
 |---|:---:|---|
@@ -116,7 +115,7 @@ O sistema roda três tarefas em pipeline. O áudio entra pela Task 1, o índice 
 
 Quem executa primeiro é decidido pelas prioridades, o que torna o escalonamento previsível, e o core 0 fica livre para o sistema.
 
-### 5.3 Fluxo de dados
+### 3. Fluxo de dados
 
 1. A Task 1 lê blocos de 512 amostras e os copia para o buffer ativo. Cada buffer tem `EI_CLASSIFIER_SLICE_SIZE` = **4.000 amostras** (250 ms a 16 kHz).
 2. Quando o buffer enche, a Task 1 registra o instante, envia o **índice** do buffer para `xCaptureQueue` e troca para o outro buffer.
@@ -125,18 +124,16 @@ Quem executa primeiro é decidido pelas prioridades, o que torna o escalonamento
 5. Se a classe for `acende`, a confiança superar o limiar e o cooldown tiver passado, liga o LED e reinicia o timer de 1 s. Em seguida, libera o buffer para a Task 1.
 
 
-### 5.4 Alerta
+### 4. Alerta
 
 O alerta é o LED no GPIO 17. O LED liga na Task 3 e é apagado pelo callback do software timer, 1 segundo depois. Como o apagamento não depende de nenhuma das três tarefas do pipeline, a Task 3 não precisa se bloquear esperando (nada de `delay`), e a captura e a classificação continuam durante o tempo em que o LED está aceso.
 
-### 5.5 Decisão de acionamento
+### 5. Decisão de acionamento
 
 A decisão usa a classificação de **uma única fatia**: a classe mais provável precisa ser `acende` e a confiança precisa superar `HIGH_CONFIDENCE_THRESHOLD` (**0,50** no firmware que gravei). 
 
 
-## 6. Metodologia de teste
-
-### 6.1 Script de teste
+## Testes
 
 Escrevi o script `teste/script_teste.py` (Python). Ele conduz um protocolo fixo, lê a saída serial do ESP32 e classifica automaticamente cada tentativa. Em cada tentativa ele:
 
@@ -148,9 +145,9 @@ Escrevi o script `teste/script_teste.py` (Python). Ele conduz um protocolo fixo,
 Só a classe `acende` **deve** acionar o LED. As demais são negativas: se o LED acender, é falso positivo. O script gera a matriz de confusão, as métricas e a tabela de latência por etapa, e salva `resultados.csv`, `resumo.md` e o log bruto da serial.
 
 
-## 7. Resultados
+## Resultados
 
-### 7.1 Matriz de confusão (acionamento do LED)
+### 1. Matriz de confusão (acionamento do LED)
 
 | | LED acionou | LED não acionou |
 |---|---:|---:|
@@ -167,7 +164,7 @@ Só a classe `acende` **deve** acionar o LED. As demais são negativas: se o LED
 
 Os intervalos de confiança foram calculados pelo método de Wilson. Eles são largos por causa do número pequeno de tentativas.
 
-### 7.2 Resultado por classe
+### 2. Resultado por classe
 
 | Classe | Tentativas | LED acionou | Taxa de acionamento |
 |---|---:|---:|---:|
@@ -178,7 +175,7 @@ Os intervalos de confiança foram calculados pelo método de Wilson. Eles são l
 
 O requisito principal do comportamento, **"apaga" não acender o LED**, foi atendido em 19 das 20 tentativas (95 %).
 
-### 7.3 Erros
+### 3. Erros
 
 | Tentativa | Classe | Tipo | Maior confiança em "acende" | Observação |
 |---:|---|---|---:|---|
@@ -193,7 +190,7 @@ O requisito principal do comportamento, **"apaga" não acender o LED**, foi aten
 Nos acionamentos corretos, a maior confiança em "acende" ficou entre 0,59 e 0,85 (média 0,71).
 
 
-## 8. Análise de latência
+## Análise de latência
 
 A latência de cada etapa é medida no próprio firmware, com `esp_timer_get_time()` (microssegundos). Os timestamps viajam dentro do pacote de features, e a Task 3 calcula as durações e acumula mínimo, média e máximo. Os valores abaixo vêm das 1.499 fatias classificadas durante toda a execução do teste.
 
@@ -211,7 +208,7 @@ A latência de cada etapa é medida no próprio firmware, com `esp_timer_get_tim
 **Etapa de captura.** O tempo de encher um buffer é, por construção, o da duração da fatia: 4.000 amostras ÷ 16.000 Hz = **250 ms**. Esse valor é teórico, e não fez parte da tabela medida.
 
 
-### 8.1 Análise dos resultados
+### 1. Análise dos resultados
 
 O comportamento principal funciona. O sistema acende o LED para "acende" em 90 % das vezes e "apaga" quase nunca o aciona (5 %).
 
@@ -232,7 +229,7 @@ O limiar usado no teste foi 0,50, e a linha "0,45 a 0,50" da tabela reproduz o r
 A acurácia de validação do Studio (85,2 %) e a acurácia do meu teste (86 %) são parecidas.
 
 
-## 9. Conclusão
+## Conclusão
 
 Consegui implementar um detector de comando de voz embarcado com FreeRTOS que atende ao comportamento que defini: "acende" liga o LED por 1 segundo, e "apaga" não faz nada. A arquitetura com três tarefas, dois semáforos, duas filas, três mutexes e um software timer funcionou sem gargalo nas filas (as esperas foram de uma fração de milissegundo), com latência de processamento de ~113 ms para fatias de 250 ms.
 
