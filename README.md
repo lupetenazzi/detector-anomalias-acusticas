@@ -58,7 +58,7 @@ ESP32, microfone INMP441, LED com resistor.
 ## Para gravar o firmware
 
 1. No Arduino IDE, instale o suporte à placa **ESP32**
-2. Instale a biblioteca do modelo exportada do Edge Impulse: *Sketch → Include Library → Add .ZIP Library…*
+2. Instale a biblioteca do modelo exportada do Edge Impulse: *Sketch → Include Library → Add .ZIP Library…* (essa biblioteca é o arquivo lib.zip, presente na raiz)
 3. Abra `firmware/detector_anomalias.ino`, compile e grave na placa
 4. Abra o Monitor Serial a **115200 baud** para ver o log de cada fatia de áudio
 
